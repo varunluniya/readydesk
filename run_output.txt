@@ -1,0 +1,24 @@
+--- Application: clean ---
+Route:      direct_to_underwriter
+Confidence: 1.00
+Missing documents: none
+Field issues: none
+
+--- Application: minor_issues ---
+Route:      flag_for_review
+Confidence: 0.79
+Missing documents: address_proof
+Field issues:
+  - pan_number: invalid format ('abcde1234f')
+
+--- Application: serious_issues ---
+Route:      return_to_applicant
+Confidence: 0.25
+Missing documents: income_proof, bank_statement, address_proof
+Field issues:
+  - applicant_name: missing
+  - pan_number: invalid format ('12345')
+  - phone_number: invalid format ('12345')
+  - loan_amount: must be greater than zero
+  - monthly_income: not numeric ('N/A')
+
