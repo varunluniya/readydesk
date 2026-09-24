@@ -1,0 +1,7 @@
+== ReadyDesk eval ==
+cases=11 runs/case=3 accuracy=100.0% consistency=100.0%
+  feedback                     acc=100.0% cons=100.0% n=1
+  hard_cases                   acc=100.0% cons=100.0% n=6
+  resubmission                 acc=100.0% cons=100.0% n=1
+  v1_samples                   acc=100.0% cons=100.0% n=3
+GATE: PASS

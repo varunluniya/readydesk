@@ -1,0 +1,12 @@
+case                                correct                 v1                      v2                      
+clean                               direct_to_underwriter   direct_to_underwriter   direct_to_underwriter   
+minor_issues                        flag_for_review         flag_for_review         flag_for_review         
+serious_issues                      return_to_applicant     return_to_applicant     return_to_applicant     
+self-employed-missing-itr           flag_for_review         direct_to_underwriter ✗ flag_for_review         
+expired-id                          flag_for_review         direct_to_underwriter ✗ flag_for_review         
+stale-statement-and-name-mismatch   flag_for_review         direct_to_underwriter ✗ flag_for_review         
+income-gap                          flag_for_review         direct_to_underwriter ✗ flag_for_review         
+two-wheeler-light-checklist         direct_to_underwriter   flag_for_review ✗       direct_to_underwriter   
+high-value-needs-itr                flag_for_review         direct_to_underwriter ✗ flag_for_review         
+
+v1 correct: 3/9   v2 correct: 9/9
