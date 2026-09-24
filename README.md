@@ -45,6 +45,17 @@ curl -X POST localhost:8000/check -H 'content-type: application/json' -d '{"appl
 | `POST /feedback` | Underwriter verdict → threshold learning |
 | `GET /insights` | Most common issues, guardrails, current thresholds |
 
+## Demo data
+
+`python seed.py` fills `data/readydesk.db` with synthetic history so every endpoint returns something meaningful on first run: 360 applications (430 submissions including resubmissions) across personal, two-wheeler and home loans with realistic defects, and underwriter verdicts that have already tuned the routing threshold.
+
+```bash
+python seed.py            # create data/readydesk.db
+python seed.py --reset    # rebuild it from scratch
+```
+
+The Docker image seeds `/data` on first boot (set `GEN4_SEED=0` to start empty). All of it is synthetic: no real customers, patients, tickets or model outputs. `GET /health` shows the dataset's counts.
+
 ---
 
 ## The original engine (v1)
