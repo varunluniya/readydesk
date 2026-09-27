@@ -26,7 +26,7 @@ from pathlib import Path
 
 from checklists import FRESH_DAYS, HEADINGS, HIGH_VALUE_ABOVE, INCOME_TOLERANCE, required_documents
 from confidence_gate import FIELD_ISSUE_PENALTY, HIGH_THRESH, LOW_THRESH, MISSING_DOC_PENALTY, call_llm_analysis
-from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace
+from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace, guardrail_check
 from gen4 import feedback as fb
 
 SYSTEM = "readydesk"
@@ -160,7 +160,7 @@ class ReadyDeskService:
         for r in dict.fromkeys(rules):
             passages += self.kb.search(r, k=1)
         trace.cite({(p.source, p.heading): p for p in passages}.values())
-        msg = self._message(route, a, diff) if route != "direct_to_underwriter" else ""
+        msg = self._message(route, a, diff, passages) if route != "direct_to_underwriter" else ""
         trace.model = {"provider": self.llm.last_provider}
 
         out = {"application_id": app_id, "route": route, "confidence": c,
@@ -170,7 +170,7 @@ class ReadyDeskService:
                                           "applicant_type": a["applicant_type"]}, out)
         return {"decision_id": did, **out, "trace": trace.as_dict()}
 
-    def _message(self, route: str, a: dict, diff: dict | None) -> str:
+    def _message(self, route: str, a: dict, diff: dict | None, passages) -> str:
         def offline():
             parts = []
             if diff and diff["fixed"]:
@@ -182,9 +182,33 @@ class ReadyDeskService:
             if route == "flag_for_review":
                 parts.append("Your application is with our team meanwhile; fixing these speeds it up.")
             return " ".join(parts)
-        return self.llm.complete(f"Write a short, polite message to a loan applicant. Route: {route}. "
-                                 f"Missing: {a['missing_documents']}. Issues: {a['field_issues']}. "
-                                 f"Fixed since last time: {diff and diff['fixed']}.", offline=offline, max_tokens=200)
+        draft = self.llm.complete(f"Write a short, polite message to a loan applicant. Route: {route}. "
+                                  f"Missing: {a['missing_documents']}. Issues: {a['field_issues']}. "
+                                  f"Fixed since last time: {diff and diff['fixed']}.", offline=offline, max_tokens=200)
+        return self._guarded(draft, route, a, offline(), passages)
+
+    def _guarded(self, draft: str, route: str, a: dict, fallback: str, passages) -> str:
+        """Post-model guardrail (Guide 4 Section 7.3): this message is only ever
+        sent when the application was NOT routed straight to the underwriter, so
+        two errors matter here even though the draft is grounded in the real
+        checklist -- (1) it silently drops a still-missing document or field
+        issue the applicant needs to act on, and (2) it uses approval language
+        ('you're all set', 'approved') for an application that still has open
+        items. Either one leaves the applicant with a wrong picture of where
+        their own application stands."""
+        def offline_check(response: str, _passages) -> tuple[bool, str]:
+            low = response.lower()
+            if ("all set" in low or "you're approved" in low or "you are approved" in low) and (
+                    a["missing_documents"] or a["field_issues"]):
+                return False, "draft implies the application is clear despite open missing documents/issues"
+            missing_named = [d for d in a["missing_documents"] if d.replace("_", " ") not in low and d not in low]
+            if missing_named:
+                return False, f"draft omits still-missing document(s) {missing_named}"
+            return True, ""
+        is_safe, reason = guardrail_check(draft, passages, self.llm, offline=offline_check)
+        if is_safe:
+            return draft
+        return fallback + f" (Note: guardrail replaced a draft that {reason}.)"
 
     def common_issues(self) -> list[tuple[str, int]]:
         cnt = Counter()
