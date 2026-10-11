@@ -26,7 +26,7 @@ from pathlib import Path
 
 from checklists import FRESH_DAYS, HEADINGS, HIGH_VALUE_ABOVE, INCOME_TOLERANCE, required_documents
 from confidence_gate import FIELD_ISSUE_PENALTY, HIGH_THRESH, LOW_THRESH, MISSING_DOC_PENALTY, call_llm_analysis
-from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace
+from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace, guardrail_check
 from gen4 import feedback as fb
 
 SYSTEM = "readydesk"
@@ -160,7 +160,7 @@ class ReadyDeskService:
         for r in dict.fromkeys(rules):
             passages += self.kb.search(r, k=1)
         trace.cite({(p.source, p.heading): p for p in passages}.values())
-        msg = self._message(route, a, diff) if route != "direct_to_underwriter" else ""
+        msg = self._message(route, a, diff, passages) if route != "direct_to_underwriter" else ""
         trace.model = {"provider": self.llm.last_provider}
 
         out = {"application_id": app_id, "route": route, "confidence": c,
@@ -170,7 +170,7 @@ class ReadyDeskService:
                                           "applicant_type": a["applicant_type"]}, out)
         return {"decision_id": did, **out, "trace": trace.as_dict()}
 
-    def _message(self, route: str, a: dict, diff: dict | None) -> str:
+    def _message(self, route: str, a: dict, diff: dict | None, passages) -> str:
         def offline():
             parts = []
             if diff and diff["fixed"]:
@@ -182,9 +182,33 @@ class ReadyDeskService:
             if route == "flag_for_review":
                 parts.append("Your application is with our team meanwhile; fixing these speeds it up.")
             return " ".join(parts)
-        return self.llm.complete(f"Write a short, polite message to a loan applicant. Route: {route}. "
-                                 f"Missing: {a['missing_documents']}. Issues: {a['field_issues']}. "
-                                 f"Fixed since last time: {diff and diff['fixed']}.", offline=offline, max_tokens=200)
+        draft = self.llm.complete(f"Write a short, polite message to a loan applicant. Route: {route}. "
+                                  f"Missing: {a['missing_documents']}. Issues: {a['field_issues']}. "
+                                  f"Fixed since last time: {diff and diff['fixed']}.", offline=offline, max_tokens=200)
+        return self._guarded(draft, route, a, offline(), passages)
+
+    def _guarded(self, draft: str, route: str, a: dict, fallback: str, passages) -> str:
+        """Post-model guardrail: this message is only ever
+        sent when the application was NOT routed straight to the underwriter, so
+        two errors matter here even though the draft is grounded in the real
+        checklist -- (1) it silently drops a still-missing document or field
+        issue the applicant needs to act on, and (2) it uses approval language
+        ('you're all set', 'approved') for an application that still has open
+        items. Either one leaves the applicant with a wrong picture of where
+        their own application stands."""
+        def offline_check(response: str, _passages) -> tuple[bool, str]:
+            low = response.lower()
+            if ("all set" in low or "you're approved" in low or "you are approved" in low) and (
+                    a["missing_documents"] or a["field_issues"]):
+                return False, "draft implies the application is clear despite open missing documents/issues"
+            missing_named = [d for d in a["missing_documents"] if d.replace("_", " ") not in low and d not in low]
+            if missing_named:
+                return False, f"draft omits still-missing document(s) {missing_named}"
+            return True, ""
+        is_safe, reason = guardrail_check(draft, passages, self.llm, offline=offline_check)
+        if is_safe:
+            return draft
+        return fallback + f" (Note: guardrail replaced a draft that {reason}.)"
 
     def common_issues(self) -> list[tuple[str, int]]:
         cnt = Counter()
@@ -199,26 +223,55 @@ class ReadyDeskService:
             raise KeyError(decision_id)
         return self.learn()
 
+    LEARN_KEY = "readydesk_learn"
+    LEARN_GRACE_DAYS = 1
+
     def learn(self, window: int = 200, min_n: int = 20) -> dict:
-        done = self.memory.decisions(system=SYSTEM, with_outcome=True, limit=window)
-        direct = [d for d in done if d["output"]["route"] == "direct_to_underwriter"]
-        flagged = [d for d in done if d["output"]["route"] == "flag_for_review"]
+        """Incremental-loading fix: `decisions(..., limit=window)` looks bounded because
+        of the LIMIT, but without a watermark SQLite still has to SCAN every
+        decision this system has ever logged and sort it by ts before it can
+        take the top `window` -- confirmed via EXPLAIN QUERY PLAN, and the
+        same shape as the classic full-rescan mistake even though the result size is
+        capped. The guardrail's "last `window` verdicts" semantics is real
+        business logic (a deliberately bounded, recent-only sample), so
+        instead of switching to an all-time cumulative count, this keeps a
+        persisted sliding window: new outcomes since the watermark are
+        appended to it and it's trimmed back down to `window`, so a call
+        with nothing new touches zero old rows."""
+        new = fb.new_rows_since(self.memory, SYSTEM, self.LEARN_KEY, grace_days=self.LEARN_GRACE_DAYS,
+                                limit=window)
+        ring_key = f"ring:{self.LEARN_KEY}"
+        ring = self.memory.get_param(ring_key, [])
+        # new_rows_since returns most-recent-decision-first; append in
+        # chronological order so trimming to the tail keeps the most
+        # recent `window` verdicts, matching the original query's order.
+        for d in reversed(new):
+            ring.append({"route": d["output"]["route"], "actually_complete": d["outcome"]["actually_complete"]})
+        # Always re-trim to `window` (even with nothing new) so a caller is
+        # never stuck with a stale size from an earlier call that used a
+        # different window value.
+        ring = ring[-window:]
+        self.memory.set_param(ring_key, ring, reason="incremental learn(): slide window")
+        fb.mark_processed(self.memory, self.LEARN_KEY, new)
+
+        direct = [r for r in ring if r["route"] == "direct_to_underwriter"]
+        flagged = [r for r in ring if r["route"] == "flag_for_review"]
         false_complete = fb.Guardrail("false_complete_rate", 0.10, min_n).check(
-            sum(1 for d in direct if not d["outcome"]["actually_complete"]), len(direct))
+            sum(1 for d in direct if not d["actually_complete"]), len(direct))
         needless_flag = fb.Guardrail("needless_flag_rate", 0.60, min_n).check(
-            sum(1 for d in flagged if d["outcome"]["actually_complete"]), len(flagged))
+            sum(1 for d in flagged if d["actually_complete"]), len(flagged))
         high = self.thresholds()["high"]
         action = None
         last = self.memory.get_param("high_threshold_n", 0)
-        if len(done) - last >= COOLDOWN:  # at most one step per 10 new verdicts
+        if len(ring) - last >= COOLDOWN:  # at most one step per 10 new verdicts
             if false_complete["tripped"] and high < HIGH_BOUNDS[1]:
-                new = round(min(HIGH_BOUNDS[1], high + STEP), 3)
-                self.memory.set_param("high_threshold", new, "false-complete rate above 10% (lower bound)")
-                action = f"high threshold {high} -> {new}"
+                new_high = round(min(HIGH_BOUNDS[1], high + STEP), 3)
+                self.memory.set_param("high_threshold", new_high, "false-complete rate above 10% (lower bound)")
+                action = f"high threshold {high} -> {new_high}"
             elif needless_flag["tripped"] and high > HIGH_BOUNDS[0]:
-                new = round(max(HIGH_BOUNDS[0], high - STEP), 3)
-                self.memory.set_param("high_threshold", new, "most flagged applications were complete")
-                action = f"high threshold {high} -> {new}"
-            self.memory.set_param("high_threshold_n", len(done))
+                new_high = round(max(HIGH_BOUNDS[0], high - STEP), 3)
+                self.memory.set_param("high_threshold", new_high, "most flagged applications were complete")
+                action = f"high threshold {high} -> {new_high}"
+            self.memory.set_param("high_threshold_n", len(ring))
         return {"false_complete": false_complete, "needless_flag": needless_flag, "action": action,
                 "thresholds": self.thresholds()}
